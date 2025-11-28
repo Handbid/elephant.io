@@ -297,9 +297,9 @@ class Client {
      */
     public function close() {
         if ($this->fd) {
-            // Send Engine.IO close packet
-            $this->write($this->encode((string)self::EIO_CLOSE), false);
-            fclose($this->fd);
+            // Send Engine.IO close packet (ignore errors if connection already closed)
+            @$this->write($this->encode((string)self::EIO_CLOSE), false);
+            @fclose($this->fd);
             $this->fd = null;
             return true;
         }
