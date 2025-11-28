@@ -141,7 +141,17 @@ class Client {
      * @access public
      * @return string
      */
-    public function read() {
+    public function read($timeout = 2) {
+        // Wait for data to be available using stream_select
+        $read = array($this->fd);
+        $write = $except = null;
+        $ready = stream_select($read, $write, $except, $timeout);
+
+        if ($ready === false || $ready === 0) {
+            $this->stdout('debug', 'No data available (timeout=' . $timeout . 's)');
+            return '';
+        }
+
         // Read WebSocket frame header
         $firstByte = fread($this->fd, 1);
         if ($firstByte === false || strlen($firstByte) === 0) {
@@ -181,11 +191,11 @@ class Client {
      */
     public function of($endpoint = null) {
         if ($endpoint && !in_array($endpoint, $this->endpoints)) {
-            // Socket.io 4.x namespace connection: 40/namespace,
-            $namespacePacket = self::EIO_MESSAGE . '' . self::SIO_CONNECT . $endpoint . ',';
+            // Socket.io 4.x namespace connection: 40/namespace,{}
+            $namespacePacket = self::EIO_MESSAGE . '' . self::SIO_CONNECT . $endpoint . ',{}';
             $this->write($this->encode($namespacePacket));
             $this->endpoints[] = $endpoint;
-            $this->stdout('debug', 'Joined namespace: ' . $endpoint);
+            $this->stdout('debug', 'Joining namespace: ' . $endpoint . ' with packet: ' . $namespacePacket);
 
             // Read namespace connection acknowledgment
             if ($this->read) {
@@ -505,6 +515,9 @@ class Client {
             throw new \Exception('fsockopen error: ' . $errstr . ' (' . $errno . ')');
         }
 
+        // Set read/write timeout for the socket (5 seconds)
+        stream_set_timeout($this->fd, 5);
+
         $key = $this->generateKey();
 
         // Socket.io 4.x WebSocket upgrade path: /socket.io/?EIO=4&transport=websocket&sid=xxx
@@ -544,7 +557,25 @@ class Client {
 
         $this->stdout('info', 'WebSocket connected');
 
-        // Send Socket.IO connect packet for default namespace
+        // Engine.IO 4 upgrade handshake:
+        // 1. Send "2probe" (ping with probe payload)
+        $this->stdout('debug', 'Sending probe ping...');
+        $this->write($this->encode(self::EIO_PING . 'probe'), false);
+
+        // 2. Wait for "3probe" (pong with probe payload)
+        if ($this->read) {
+            $probeResponse = $this->read();
+            $this->stdout('debug', 'Probe response: ' . $probeResponse);
+            if ($probeResponse !== '3probe') {
+                $this->stdout('error', 'Expected 3probe, got: ' . $probeResponse);
+            }
+        }
+
+        // 3. Send "5" (upgrade packet)
+        $this->stdout('debug', 'Sending upgrade packet...');
+        $this->write($this->encode((string)self::EIO_UPGRADE), false);
+
+        // 4. Now send Socket.IO connect packet for default namespace
         // Format: 40 (EIO message + SIO connect)
         $connectPacket = self::EIO_MESSAGE . '' . self::SIO_CONNECT;
         $this->write($this->encode($connectPacket));
