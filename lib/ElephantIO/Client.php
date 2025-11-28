@@ -6,20 +6,14 @@ require_once(__DIR__.'/Payload.php');
 require_once(__DIR__.'/Frame.php');
 
 /**
+ * ElephantIOClient - Socket.io 4.x compatible PHP client
  *
- * NAMESPACES (endpoints)
- *
- * emit and send method automatically register socket into received endpoint
- *
- */
-
-/**
- * ElephantIOClient is a rough implementation of socket.io protocol.
- * It should ease you dealing with a socket.io server.
- *
- * @author Ludovic Barreca <ludovic@balloonup.com>
+ * Updated to support Socket.io 4.x / Engine.IO 4 protocol
+ * Original author: Ludovic Barreca <ludovic@balloonup.com>
+ * Socket.io 4.x update: Handbid Inc.
  */
 class Client {
+    // Legacy type constants (kept for backward compatibility with Frame.php)
     const TYPE_DISCONNECT   = 0;
     const TYPE_CONNECT      = 1;
     const TYPE_HEARTBEAT    = 2;
@@ -30,14 +24,32 @@ class Client {
     const TYPE_ERROR        = 7;
     const TYPE_NOOP         = 8;
 
-	public $origin = '*';
-	public $cookie;
-	public $sendCookie = false;
+    // Engine.IO 4 packet types
+    const EIO_OPEN          = 0;
+    const EIO_CLOSE         = 1;
+    const EIO_PING          = 2;
+    const EIO_PONG          = 3;
+    const EIO_MESSAGE       = 4;
+    const EIO_UPGRADE       = 5;
+    const EIO_NOOP          = 6;
 
-    private $socketIOUrl;
+    // Socket.IO 4 packet types (within EIO_MESSAGE)
+    const SIO_CONNECT       = 0;
+    const SIO_DISCONNECT    = 1;
+    const SIO_EVENT         = 2;
+    const SIO_ACK           = 3;
+    const SIO_CONNECT_ERROR = 4;
+    const SIO_BINARY_EVENT  = 5;
+    const SIO_BINARY_ACK    = 6;
+
+    public $origin = '*';
+    public $cookie;
+    public $sendCookie = false;
+
+    private $baseUrl;
     private $serverHost;
     private $serverPort = 80;
-	private $serverPath;
+    private $serverPath;
     private $session;
     private $fd;
     private $buffer;
@@ -46,13 +58,31 @@ class Client {
     private $checkSslPeer = true;
     private $debug;
     private $handshakeTimeout = null;
-	private $endpoints = array();
+    private $endpoints = array();
+    private $eioVersion = 4;
+    private $isSecure = false;
+    private $heartbeatStamp;
 
+    /**
+     * @param string $socketIOUrl Base URL (e.g., 'http://localhost:3000')
+     * @param string $socketIOPath Path prefix (default: 'socket.io')
+     * @param int $protocol Protocol version (ignored, always uses EIO=4)
+     * @param bool $read Whether to read responses
+     * @param bool $checkSslPeer Whether to verify SSL certificates
+     * @param bool $debug Enable debug output
+     */
     public function __construct($socketIOUrl, $socketIOPath = 'socket.io', $protocol = 1, $read = true, $checkSslPeer = true, $debug = false) {
-        $this->socketIOUrl = $socketIOUrl.'/'.$socketIOPath.'/'.(string)$protocol;
+        // Parse the base URL
+        $parsed = parse_url($socketIOUrl);
+
+        $this->isSecure = isset($parsed['scheme']) && $parsed['scheme'] === 'https';
+        $this->serverHost = $parsed['host'];
+        $this->serverPort = isset($parsed['port']) ? $parsed['port'] : ($this->isSecure ? 443 : 80);
+        $this->serverPath = '/' . trim($socketIOPath, '/');
+        $this->baseUrl = $socketIOUrl . '/' . trim($socketIOPath, '/');
+
         $this->read = $read;
         $this->debug = $debug;
-        $this->parseUrl();
         $this->checkSslPeer = $checkSslPeer;
     }
 
@@ -60,7 +90,7 @@ class Client {
      * Initialize a new connection
      *
      * @param boolean $keepalive
-     * @return ElephantIOClient
+     * @return Client
      */
     public function init($keepalive = false) {
         $this->handshake();
@@ -77,13 +107,15 @@ class Client {
      * Keep the connection alive and dispatch events
      *
      * @access public
-     * @todo work on callbacks
      */
     public function keepAlive() {
         while(true) {
-            if ($this->session['heartbeat_timeout'] > 0 && $this->session['heartbeat_timeout']+$this->heartbeatStamp-5 < time()) {
-                $this->send(self::TYPE_HEARTBEAT);
-                $this->heartbeatStamp = time();
+            if ($this->session['pingInterval'] > 0) {
+                $pingIntervalSec = $this->session['pingInterval'] / 1000;
+                if ($this->heartbeatStamp + $pingIntervalSec - 5 < time()) {
+                    $this->sendPing();
+                    $this->heartbeatStamp = time();
+                }
             }
 
             $r = array($this->fd);
@@ -96,19 +128,28 @@ class Client {
     }
 
     /**
+     * Send a ping packet
+     */
+    private function sendPing() {
+        $this->write($this->encode((string)self::EIO_PING));
+        $this->stdout('debug', 'Sent ping');
+    }
+
+    /**
      * Read the buffer and return the oldest event in stack
      *
      * @access public
      * @return string
-     * // https://tools.ietf.org/html/rfc6455#section-5.2
      */
     public function read() {
-        // Ignore first byte, I hope Socket.io does not send fragmented frames, so we don't have to deal with FIN bit.
-        // There are also reserved bit's which are 0 in socket.io, and opcode, which is always "text frame" in Socket.io
-        fread($this->fd, 1);
+        // Read WebSocket frame header
+        $firstByte = fread($this->fd, 1);
+        if ($firstByte === false || strlen($firstByte) === 0) {
+            return '';
+        }
 
-        // There is also masking bit, as MSB, but it's 0 in current Socket.io
-        $payload_len = ord(fread($this->fd, 1));
+        $secondByte = fread($this->fd, 1);
+        $payload_len = ord($secondByte) & 0x7F;
 
         switch ($payload_len) {
             case 126:
@@ -116,97 +157,114 @@ class Client {
                 $payload_len = $payload_len[1];
                 break;
             case 127:
-                $this->stdout('error', "Next 8 bytes are 64bit uint payload length, not yet implemented, since PHP can't handle 64bit longs!");
-                break;
+                $this->stdout('error', "64bit payload length not yet implemented");
+                return '';
         }
 
-        $payload = fread($this->fd, $payload_len);
-        $this->stdout('debug', 'Received ' . $payload);
+        $payload = '';
+        while (strlen($payload) < $payload_len) {
+            $chunk = fread($this->fd, $payload_len - strlen($payload));
+            if ($chunk === false) break;
+            $payload .= $chunk;
+        }
+
+        $this->stdout('debug', 'Received: ' . $payload);
 
         return $payload;
     }
 
-	/**
-	 * Join into socket.io namespace
-	 *
-	 * EXAMPLE:
-	 * $client = new \ElephantIO\Client();
-	 * ...
-	 * //   for entering in some namespace
-	 * $client->of('/event');
-	 * or you can use
-	 *  $client->emit();
-	 *    and
-	 *  $client->send();
-	 *
-	 * if you are not in some endpoint, you will automatically enter
-	 *
-	 *
-	 * @param string $endpoint
-	 *
-	 * @return Client
-	 */
-	public function of($endpoint = null) {
-		if ($endpoint && !in_array($endpoint, $this->endpoints)) {
-			$data = self::TYPE_CONNECT . '::' . $endpoint;
-			$this->write($this->encode($data));
-			$this->endpoints[] = $endpoint;
-		}
-		return $this;
-	}
+    /**
+     * Join into socket.io namespace
+     *
+     * @param string $endpoint
+     * @return Client
+     */
+    public function of($endpoint = null) {
+        if ($endpoint && !in_array($endpoint, $this->endpoints)) {
+            // Socket.io 4.x namespace connection: 40/namespace,
+            $namespacePacket = self::EIO_MESSAGE . '' . self::SIO_CONNECT . $endpoint . ',';
+            $this->write($this->encode($namespacePacket));
+            $this->endpoints[] = $endpoint;
+            $this->stdout('debug', 'Joined namespace: ' . $endpoint);
 
-	/**
-	 * @return Client
-	 */
-	public function leaveEndpoint($endpoint) {
-		if ($endpoint && in_array($endpoint, $this->endpoints)) {
-			$data = self::TYPE_DISCONNECT . '::' . $endpoint;
-			$this->write($this->encode($data));
-			unset($this->endpoints[array_search($endpoint, $this->endpoints)]);
-		}
-		return $this;
-	}
-
-	/**
-	 * @return Frame
-	 */
-	public function createFrame($type = null, $endpoint = null) {
-		return new Frame($this, $type, $endpoint);
-	}
-
-	/**
-	 * @param Frame $frame
-	 */
-	public function sendFrame(Frame $frame) {
-		$this->send(
-			$frame->getType(),
-			$frame->getId(),
-			$frame->getEndPoint(),
-			$frame->getData()
-		);
-	}
+            // Read namespace connection acknowledgment
+            if ($this->read) {
+                $response = $this->read();
+                $this->stdout('debug', 'Namespace response: ' . $response);
+            }
+        }
+        return $this;
+    }
 
     /**
-     * Send message to the websocket
+     * Leave a namespace
+     *
+     * @return Client
+     */
+    public function leaveEndpoint($endpoint) {
+        if ($endpoint && in_array($endpoint, $this->endpoints)) {
+            // Socket.io 4.x namespace disconnect: 41/namespace,
+            $disconnectPacket = self::EIO_MESSAGE . '' . self::SIO_DISCONNECT . $endpoint . ',';
+            $this->write($this->encode($disconnectPacket));
+            unset($this->endpoints[array_search($endpoint, $this->endpoints)]);
+        }
+        return $this;
+    }
+
+    /**
+     * @return Frame
+     */
+    public function createFrame($type = null, $endpoint = null) {
+        return new Frame($this, $type, $endpoint);
+    }
+
+    /**
+     * @param Frame $frame
+     */
+    public function sendFrame(Frame $frame) {
+        $this->send(
+            $frame->getType(),
+            $frame->getId(),
+            $frame->getEndPoint(),
+            $frame->getData()
+        );
+    }
+
+    /**
+     * Send message to the websocket (legacy compatibility wrapper)
      *
      * @access public
      * @param int $type
      * @param int $id
-     * @param int $endpoint
+     * @param string $endpoint
      * @param string $message
-     * @return \ElephantIO\Client
+     * @return Client
      */
     public function send($type, $id = null, $endpoint = null, $message = null) {
-	    if (!is_int($type) || $type < 0 || $type > 8) {
-		    throw new \InvalidArgumentException('ElephantIOClient::send() type parameter must be an integer strictly inferior to 9.');
-	    }
-	    $this->of($endpoint);
-	    $raw_message = $type . ':' . $id . ':' . $endpoint . ':' . $message;
-	    $this->write($this->encode($raw_message));
+        // Convert legacy type to Socket.io 4.x format
+        $this->of($endpoint);
 
-	    $this->stdout('debug', 'Sent ' . $raw_message);
+        // For EVENT type, message is already JSON with 'name' and 'args'
+        if ($type == self::TYPE_EVENT && $message) {
+            $decoded = json_decode($message, true);
+            if ($decoded && isset($decoded['name'])) {
+                $eventName = $decoded['name'];
+                $args = isset($decoded['args']) ? $decoded['args'] : [];
 
-	    return $this;
+                // Build Socket.io 4.x event packet: 42/namespace,["event",arg1,arg2,...]
+                $eventData = array_merge([$eventName], $args);
+                $packet = self::EIO_MESSAGE . '' . self::SIO_EVENT;
+                if ($endpoint) {
+                    $packet .= $endpoint . ',';
+                }
+                $packet .= json_encode($eventData);
+
+                $this->write($this->encode($packet));
+                $this->stdout('debug', 'Sent event: ' . $packet);
+            }
+        }
+
+        return $this;
     }
 
     /**
@@ -215,70 +273,81 @@ class Client {
      * @param string $event
      * @param array $args
      * @param string $endpoint
-     * @param function $callback - ignored for the time being
-     * @todo work on callbacks
+     * @param callable $callback - ignored for the time being
      */
-    public function emit($event, $args, $endpoint, $callback = null) {
-        $this->send(self::TYPE_EVENT, null, $endpoint, json_encode(array(
-            'name' => $event,
-            'args' => $args,
-            )
-        ));
+    public function emit($event, $args, $endpoint = null, $callback = null) {
+        $this->of($endpoint);
+
+        // Build Socket.io 4.x event packet: 42["event",arg1,arg2,...] or 42/namespace,["event",...]
+        $eventData = array_merge([$event], (array)$args);
+        $packet = self::EIO_MESSAGE . '' . self::SIO_EVENT;
+        if ($endpoint) {
+            $packet .= $endpoint . ',';
+        }
+        $packet .= json_encode($eventData);
+
+        $this->write($this->encode($packet));
+        $this->stdout('debug', 'Emitted: ' . $packet);
     }
 
-	/**
-	 * Close the socket
-	 *
-	 * @return boolean
-	 */
-	public function close() {
-		if ($this->fd) {
-			$this->write($this->encode(self::TYPE_DISCONNECT, Payload::OPCODE_CLOSE), false);
-			fclose($this->fd);
-			return true;
-		}
-		return false;
-	}
+    /**
+     * Close the socket
+     *
+     * @return boolean
+     */
+    public function close() {
+        if ($this->fd) {
+            // Send Engine.IO close packet
+            $this->write($this->encode((string)self::EIO_CLOSE), false);
+            fclose($this->fd);
+            $this->fd = null;
+            return true;
+        }
+        return false;
+    }
 
-	protected function write($data, $sleep = true) {
-		fwrite($this->getSocket(), $data);
-		// wait 100ms before closing connexion
-		if ($sleep) {
-			usleep(100 * 1000);
-		}
-		return $this;
-	}
+    protected function write($data, $sleep = true) {
+        if (!$this->fd) {
+            throw new \RuntimeException('The connection is lost');
+        }
+        fwrite($this->fd, $data);
+        // wait 100ms before closing connection (critical for race condition!)
+        if ($sleep) {
+            usleep(100 * 1000);
+        }
+        return $this;
+    }
 
-	/**
-	 * @return mixed
-	 * @throws \RuntimeException
-	 */
-	private function getSocket() {
-		if (!$this->fd) {
-			throw new \RuntimeException('The connection is lost');
-		}
-		return $this->fd;
-	}
+    /**
+     * @return resource
+     * @throws \RuntimeException
+     */
+    private function getSocket() {
+        if (!$this->fd) {
+            throw new \RuntimeException('The connection is lost');
+        }
+        return $this->fd;
+    }
 
-	/**
-	 * @param      $message
-	 * @param int  $opCode
-	 * @param bool $mask
-	 *
-	 * @return string
-	 */
-	private function encode($message, $opCode = Payload::OPCODE_TEXT, $mask = true) {
-		$payload = new Payload();
-		return $payload
-				->setOpcode($opCode)
-				->setMask($mask)
-				->setPayload($message)
-				->encodePayload();
-	}
+    /**
+     * Encode message as WebSocket frame
+     *
+     * @param string $message
+     * @param int $opCode
+     * @param bool $mask
+     * @return string
+     */
+    private function encode($message, $opCode = Payload::OPCODE_TEXT, $mask = true) {
+        $payload = new Payload();
+        return $payload
+                ->setOpcode($opCode)
+                ->setMask($mask)
+                ->setPayload($message)
+                ->encodePayload();
+    }
 
     /**
      * Send ANSI formatted message to stdout.
-     * First parameter must be either debug, info, error or ok
      *
      * @access private
      * @param string $type
@@ -297,7 +366,7 @@ class Client {
         );
 
         if (!array_key_exists($type, $typeMap)) {
-            throw new \InvalidArgumentException('ElephantIOClient::stdout $type parameter must be debug, info, error or success. Got '.$type);
+            throw new \InvalidArgumentException('ElephantIOClient::stdout $type parameter must be debug, info, error or ok. Got '.$type);
         }
 
         fwrite(STDOUT, "\033[".$typeMap[$type][0]."m".$typeMap[$type][1]."\033[37m  ".$message."\r\n");
@@ -323,148 +392,176 @@ class Client {
         $this->handshakeTimeout = $delay;
     }
 
-	/**
-	 * @return string
-	 */
-	private function getOrigin() {
-		$origin = "Origin: *\n\n";
-		if ($this->origin) {
-			if (strpos($this->origin, 'http://') === false) {
-				$origin = sprintf("Origin: http://%s\n\n", $this->origin);
-			} else {
-				$origin = sprintf("Origin: %s\n\n", $this->origin);
-			}
-		}
-		return $origin;
-	}
+    /**
+     * @return string
+     */
+    private function getOriginHeader() {
+        if ($this->origin) {
+            if (strpos($this->origin, 'http://') === false && strpos($this->origin, 'https://') === false) {
+                return sprintf("Origin: http://%s\r\n", $this->origin);
+            } else {
+                return sprintf("Origin: %s\r\n", $this->origin);
+            }
+        }
+        return "Origin: *\r\n";
+    }
 
     /**
-     * Handshake with socket.io server
+     * Handshake with socket.io 4.x server
      *
      * @access private
      * @return bool
      */
     private function handshake() {
-        $ch = curl_init($this->socketIOUrl);
+        // Socket.io 4.x handshake URL: /socket.io/?EIO=4&transport=polling
+        $handshakeUrl = $this->baseUrl . '/?EIO=' . $this->eioVersion . '&transport=polling';
+
+        $this->stdout('debug', 'Handshake URL: ' . $handshakeUrl);
+
+        $ch = curl_init($handshakeUrl);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
 
-        if (!$this->checkSslPeer)
+        if (!$this->checkSslPeer) {
             curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        }
 
         if (!is_null($this->handshakeTimeout)) {
             curl_setopt($ch, CURLOPT_CONNECTTIMEOUT_MS, $this->handshakeTimeout);
             curl_setopt($ch, CURLOPT_TIMEOUT_MS, $this->handshakeTimeout);
         }
 
-	    if ($this->origin) {
-		    curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-			    $this->getOrigin()
-		    ));
-	    }
+        $headers = array();
+        if ($this->origin) {
+            $headers[] = 'Origin: ' . ($this->origin === '*' ? '*' : $this->origin);
+        }
+        if (!empty($headers)) {
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        }
 
-	    if ($this->sendCookie && $this->cookie) {
-		    curl_setopt($ch, CURLOPT_COOKIE, $this->cookie);
-	    }
+        if ($this->sendCookie && $this->cookie) {
+            curl_setopt($ch, CURLOPT_COOKIE, $this->cookie);
+        }
 
         $res = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 
-        if ($res === false || $res === '') {
-            throw new \Exception(curl_error($ch));
+        if ($res === false) {
+            $error = curl_error($ch);
+            curl_close($ch);
+            throw new \Exception('Handshake cURL error: ' . $error);
         }
 
-	    if ($res == 'handshake bad origin') {
-		    throw new \Exception('Handshake error: bad origin');
-	    }
+        curl_close($ch);
 
-        $sess = explode(':', $res);
-        $this->session['sid'] = $sess[0];
-        $this->session['heartbeat_timeout'] = $sess[1];
-        $this->session['connection_timeout'] = $sess[2];
-        $this->session['supported_transports'] = array_flip(explode(',', $sess[3]));
-
-        if (!isset($this->session['supported_transports']['websocket'])) {
-            throw new \Exception('This socket.io server do not support websocket protocol. Terminating connection...');
+        if ($httpCode !== 200) {
+            throw new \Exception('Handshake failed with HTTP ' . $httpCode . ': ' . $res);
         }
 
-        return true;
+        $this->stdout('debug', 'Handshake response: ' . $res);
+
+        // Socket.io 4.x response format: 0{"sid":"xxx","upgrades":["websocket"],"pingInterval":25000,"pingTimeout":20000}
+        // The leading '0' is the Engine.IO OPEN packet type
+        if (strlen($res) > 0 && $res[0] === '0') {
+            $jsonData = substr($res, 1);
+            $data = json_decode($jsonData, true);
+
+            if (!$data || !isset($data['sid'])) {
+                throw new \Exception('Invalid handshake response: ' . $res);
+            }
+
+            $this->session = array(
+                'sid' => $data['sid'],
+                'upgrades' => isset($data['upgrades']) ? $data['upgrades'] : array(),
+                'pingInterval' => isset($data['pingInterval']) ? $data['pingInterval'] : 25000,
+                'pingTimeout' => isset($data['pingTimeout']) ? $data['pingTimeout'] : 20000,
+                'maxPayload' => isset($data['maxPayload']) ? $data['maxPayload'] : 1000000,
+            );
+
+            $this->stdout('info', 'Handshake successful, sid: ' . $this->session['sid']);
+
+            if (!in_array('websocket', $this->session['upgrades'])) {
+                throw new \Exception('Server does not support websocket upgrade');
+            }
+
+            return true;
+        }
+
+        throw new \Exception('Unexpected handshake response format: ' . $res);
     }
 
     /**
-     * Connects using websocket protocol
+     * Connects using websocket protocol (Socket.io 4.x)
      *
      * @access private
      * @return bool
      */
     private function connect() {
-        $this->fd = fsockopen($this->serverHost, $this->serverPort, $errno, $errstr);
+        $host = $this->isSecure ? 'ssl://' . $this->serverHost : $this->serverHost;
+
+        $this->fd = fsockopen($host, $this->serverPort, $errno, $errstr, 10);
 
         if (!$this->fd) {
-            throw new \Exception('fsockopen returned: '.$errstr);
+            throw new \Exception('fsockopen error: ' . $errstr . ' (' . $errno . ')');
         }
 
         $key = $this->generateKey();
 
-        $out  = "GET ".$this->serverPath."/websocket/".$this->session['sid']." HTTP/1.1\r\n";
-        $out .= "Host: ".$this->serverHost."\r\n";
-        $out .= "Upgrade: WebSocket\r\n";
+        // Socket.io 4.x WebSocket upgrade path: /socket.io/?EIO=4&transport=websocket&sid=xxx
+        $path = $this->serverPath . '/?EIO=' . $this->eioVersion . '&transport=websocket&sid=' . $this->session['sid'];
+
+        $out  = "GET " . $path . " HTTP/1.1\r\n";
+        $out .= "Host: " . $this->serverHost . "\r\n";
+        $out .= "Upgrade: websocket\r\n";
         $out .= "Connection: Upgrade\r\n";
-        $out .= "Sec-WebSocket-Key: ".$key."\r\n";
+        $out .= "Sec-WebSocket-Key: " . $key . "\r\n";
         $out .= "Sec-WebSocket-Version: 13\r\n";
-	    if ($this->sendCookie && $this->cookie) {
-		    $out .= "Cookie: " . $this->cookie . "\r\n";
-	    }
-	    $out .= $this->getOrigin();
+        if ($this->sendCookie && $this->cookie) {
+            $out .= "Cookie: " . $this->cookie . "\r\n";
+        }
+        $out .= $this->getOriginHeader();
+        $out .= "\r\n";
+
+        $this->stdout('debug', 'WebSocket upgrade request: ' . $path);
 
         fwrite($this->fd, $out);
 
         $res = fgets($this->fd);
 
         if ($res === false) {
-            throw new \Exception('Socket.io did not respond properly. Aborting...');
+            throw new \Exception('Socket.io did not respond to WebSocket upgrade');
         }
 
-        if ($subres = substr($res, 0, 12) != 'HTTP/1.1 101') {
-            throw new \Exception('Unexpected Response. Expected HTTP/1.1 101 got '.$subres.'. Aborting...');
+        if (strpos($res, '101') === false) {
+            throw new \Exception('WebSocket upgrade failed: ' . trim($res));
         }
 
+        // Read remaining headers
         while(true) {
             $res = trim(fgets($this->fd));
             if ($res === '') break;
         }
 
+        $this->stdout('info', 'WebSocket connected');
+
+        // Send Socket.IO connect packet for default namespace
+        // Format: 40 (EIO message + SIO connect)
+        $connectPacket = self::EIO_MESSAGE . '' . self::SIO_CONNECT;
+        $this->write($this->encode($connectPacket));
+
+        // Read connection acknowledgment
         if ($this->read) {
-            if ($this->read() != '1::') {
-                throw new \Exception('Socket.io did not send connect response. Aborting...');
-            } else {
-                $this->stdout('info', 'Server report us as connected !');
+            $response = $this->read();
+            $this->stdout('debug', 'Connect response: ' . $response);
+
+            // Expected: 40{"sid":"..."} for successful connection
+            if (strpos($response, '40') !== 0) {
+                $this->stdout('error', 'Unexpected connect response: ' . $response);
             }
         }
 
-//        $this->send(self::TYPE_CONNECT);
         $this->heartbeatStamp = time();
-    }
-
-    /**
-     * Parse the url and set server parameters
-     *
-     * @access private
-     * @return bool
-     */
-    private function parseUrl() {
-        $url = parse_url($this->socketIOUrl);
-
-        $this->serverPath = $url['path'];
-        $this->serverHost = $url['host'];
-        $this->serverPort = isset($url['port']) ? $url['port'] : null;
-
-        if (array_key_exists('scheme', $url) && $url['scheme'] == 'https') {
-            $this->serverHost = 'ssl://'.$this->serverHost;
-            if (!$this->serverPort) {
-                $this->serverPort = 443;
-            }
-        }
 
         return true;
     }
-
 }
