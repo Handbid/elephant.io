@@ -316,12 +316,13 @@ class Client {
         return false;
     }
 
-    protected function write($data, $sleep = true) {
+    protected function write($data, $sleep = false) {
         if (!$this->fd) {
             throw new \RuntimeException('The connection is lost');
         }
         fwrite($this->fd, $data);
-        // wait 100ms before closing connection (critical for race condition!)
+        // Note: 100ms delay removed - Socket.io 4.x has proper WebSocket framing
+        // If race conditions occur, set $sleep = true or add delay before close()
         if ($sleep) {
             usleep(100 * 1000);
         }
