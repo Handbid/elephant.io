@@ -298,6 +298,11 @@ class Client {
 
         $this->write($this->encode($packet));
         $this->stdout('debug', 'Emitted: ' . $packet);
+
+        // Small delay to ensure event is processed before connection closes
+        // Required for Socket.io 4.x WebSocket framing - without this delay,
+        // the connection may close before the server processes the event
+        usleep(50000); // 50ms
     }
 
     /**
