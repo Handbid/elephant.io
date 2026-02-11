@@ -397,6 +397,29 @@ class Client {
     }
 
     /**
+     * Check if the WebSocket connection is still alive
+     *
+     * @return bool
+     */
+    public function isConnected() {
+        return $this->fd && !feof($this->fd);
+    }
+
+    /**
+     * Reconnect by closing the current connection and re-initializing.
+     * Resets internal state (namespace subscriptions, ack IDs, session)
+     * so the new connection starts clean.
+     */
+    public function reconnect() {
+        $this->close();
+        $this->endpoints = [];
+        $this->lastId = 0;
+        $this->session = null;
+        $this->handshake();
+        $this->connect();
+    }
+
+    /**
      * Close the socket
      *
      * @return boolean
