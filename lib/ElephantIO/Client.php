@@ -340,7 +340,17 @@ class Client {
             $response = $this->read(1); // 1 second read timeout per attempt
 
             if (empty($response)) {
-                continue; // No data yet, keep waiting
+                // Detect dead socket early instead of spinning for full timeout
+                if ($this->fd && feof($this->fd)) {
+                    if (class_exists('\Yii', false)) {
+                        \Yii::warning("[SOCKET-DEAD] event={$event} ackId={$ackId} attempts={$attempts} - connection dead (EOF)", 'node-events');
+                    }
+                    throw new \RuntimeException(
+                        'Socket.io connection is dead (EOF) while waiting for ack on event: ' . $event
+                    );
+                }
+                usleep(50000); // 50ms sleep prevents tight spin if feof() not triggered
+                continue;
             }
 
             $this->stdout('debug', 'Received response: ' . $response);
@@ -402,6 +412,49 @@ class Client {
      * @return bool
      */
     public function isConnected() {
+        return $this->fd && !feof($this->fd);
+    }
+
+    /**
+     * Read any pending data from the socket and respond to Engine.IO pings.
+     * Call this between operations to keep the persistent connection alive.
+     *
+     * The Node server sends Engine.IO pings every pingInterval (default 25s).
+     * If pings go unanswered for pingTimeout (default 20s), the server closes
+     * the connection. This method drains pending pings so the connection survives
+     * idle periods between RabbitMQ messages.
+     *
+     * @return bool True if connection is still alive, false if dead
+     */
+    public function maintainConnection() {
+        if (!$this->fd || feof($this->fd)) {
+            return false;
+        }
+
+        // Non-blocking check for pending data (0 timeout)
+        $read = [$this->fd];
+        $write = $except = null;
+        $ready = stream_select($read, $write, $except, 0);
+
+        while ($ready > 0) {
+            $response = $this->read(0);
+
+            if ($response === '') {
+                break; // No more data
+            }
+
+            // Engine.IO ping → respond with pong
+            if ($response === '2') {
+                $this->write($this->encode('3'));
+                $this->stdout('debug', 'Keepalive: responded to ping');
+            }
+
+            // Check if more data is waiting
+            $read = [$this->fd];
+            $write = $except = null;
+            $ready = stream_select($read, $write, $except, 0);
+        }
+
         return $this->fd && !feof($this->fd);
     }
 
