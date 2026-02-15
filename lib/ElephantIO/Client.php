@@ -198,10 +198,10 @@ class Client {
             $this->stdout('debug', 'Joining namespace: ' . $endpoint . ' with packet: ' . $namespacePacket);
 
             // Read namespace connection acknowledgment
-            if ($this->read) {
-                $response = $this->read();
-                $this->stdout('debug', 'Namespace response: ' . $response);
-            }
+            // Always read — ensures the namespace is fully joined before
+            // emitWithAck() sends events that require the namespace.
+            $response = $this->read();
+            $this->stdout('debug', 'Namespace response: ' . $response);
         }
         return $this;
     }
@@ -736,12 +736,13 @@ class Client {
         $this->write($this->encode(self::EIO_PING . 'probe'), false);
 
         // 2. Wait for "3probe" (pong with probe payload)
-        if ($this->read) {
-            $probeResponse = $this->read();
-            $this->stdout('debug', 'Probe response: ' . $probeResponse);
-            if ($probeResponse !== '3probe') {
-                $this->stdout('error', 'Expected 3probe, got: ' . $probeResponse);
-            }
+        // Always read — this is part of the Engine.IO upgrade handshake,
+        // not an application read. Skipping leaves frames in the buffer
+        // that interfere with emitWithAck() on fresh connections.
+        $probeResponse = $this->read();
+        $this->stdout('debug', 'Probe response: ' . $probeResponse);
+        if ($probeResponse !== '3probe') {
+            $this->stdout('error', 'Expected 3probe, got: ' . $probeResponse);
         }
 
         // 3. Send "5" (upgrade packet)
@@ -754,14 +755,15 @@ class Client {
         $this->write($this->encode($connectPacket));
 
         // Read connection acknowledgment
-        if ($this->read) {
-            $response = $this->read();
-            $this->stdout('debug', 'Connect response: ' . $response);
+        // Always read — this is the default namespace connect ack.
+        // Skipping leaves it in the buffer where emitWithAck() has to
+        // discard it, wasting read cycles on fresh connections.
+        $response = $this->read();
+        $this->stdout('debug', 'Connect response: ' . $response);
 
-            // Expected: 40{"sid":"..."} for successful connection
-            if (strpos($response, '40') !== 0) {
-                $this->stdout('error', 'Unexpected connect response: ' . $response);
-            }
+        // Expected: 40{"sid":"..."} for successful connection
+        if (strpos($response, '40') !== 0) {
+            $this->stdout('error', 'Unexpected connect response: ' . $response);
         }
 
         $this->heartbeatStamp = time();
