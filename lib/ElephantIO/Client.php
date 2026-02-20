@@ -473,6 +473,104 @@ class Client {
     }
 
     /**
+     * Emit an event and wait for server acknowledgment
+     *
+     * This provides guaranteed delivery - the method only returns successfully
+     * when the server has confirmed receipt of the event.
+     *
+     * @param string $event Event name
+     * @param array $args Event arguments
+     * @param string $endpoint Namespace (e.g., '/server')
+     * @param int $timeout Timeout in seconds to wait for ack
+     * @return bool True if acknowledged
+     * @throws \RuntimeException If ack not received within timeout
+     */
+    public function emitWithAck($event, $args, $endpoint = null, $timeout = 5) {
+        $this->of($endpoint);
+
+        // Generate unique ack ID
+        $ackId = ++$this->lastId;
+
+        // Build Socket.io 4.x event packet WITH ack ID:
+        // Format: 42/namespace,<ackId>["event",arg1,arg2,...]
+        // The ack ID comes BEFORE the JSON array
+        $eventData = array_merge([$event], (array)$args);
+        $packet = self::EIO_MESSAGE . '' . self::SIO_EVENT;
+        if ($endpoint) {
+            $packet .= $endpoint . ',';
+        }
+        $packet .= $ackId . json_encode($eventData);
+
+        $this->write($this->encode($packet));
+        $this->stdout('debug', 'Emitted with ack (id=' . $ackId . '): ' . $packet);
+
+        // Wait for ack response: 43/namespace,<ackId>[data] or 43<ackId>[data]
+        $startTime = time();
+        $attempts = 0;
+        while ((time() - $startTime) < $timeout) {
+            $attempts++;
+            $response = $this->read(1); // 1 second read timeout per attempt
+
+            if (empty($response)) {
+                continue; // No data yet, keep waiting
+            }
+
+            $this->stdout('debug', 'Received response: ' . $response);
+
+            // Parse ack response
+            // Format: 43/namespace,<ackId>[...] or 43<ackId>[...]
+            // Engine.IO MESSAGE (4) + Socket.IO ACK (3) = "43"
+            if (strpos($response, '43') === 0) {
+                // Extract ack ID from response
+                $ackPart = substr($response, 2); // Remove "43"
+
+                // Handle namespace prefix if present
+                if ($endpoint && strpos($ackPart, $endpoint . ',') === 0) {
+                    $ackPart = substr($ackPart, strlen($endpoint) + 1);
+                }
+
+                // Extract numeric ack ID (everything before '[')
+                $bracketPos = strpos($ackPart, '[');
+                if ($bracketPos !== false) {
+                    $responseAckId = (int)substr($ackPart, 0, $bracketPos);
+                } else {
+                    $responseAckId = (int)$ackPart;
+                }
+
+                if ($responseAckId === $ackId) {
+                    $this->stdout('debug', 'Ack received for id=' . $ackId);
+                    // Log successful ack to Yii if available
+                    if (class_exists('\Yii', false)) {
+                        \Yii::info("[SOCKET-ACK-OK] event={$event} ackId={$ackId} attempts={$attempts}", 'node-events');
+                    }
+                    return true;
+                } else {
+                    $this->stdout('debug', 'Ack ID mismatch: expected=' . $ackId . ', got=' . $responseAckId);
+                    // Log mismatch
+                    if (class_exists('\Yii', false)) {
+                        \Yii::warning("[SOCKET-ACK-MISMATCH] event={$event} expected={$ackId} got={$responseAckId}", 'node-events');
+                    }
+                }
+            }
+
+            // Handle ping during wait (keep connection alive)
+            if ($response === '2') {
+                $this->write($this->encode('3')); // Send pong
+                $this->stdout('debug', 'Responded to ping while waiting for ack');
+            }
+        }
+
+        // Log timeout
+        if (class_exists('\Yii', false)) {
+            \Yii::error("[SOCKET-ACK-TIMEOUT] event={$event} ackId={$ackId} timeout={$timeout}s attempts={$attempts}", 'node-events');
+        }
+
+        throw new \RuntimeException(
+            'Socket.io acknowledgment not received within ' . $timeout . ' seconds for event: ' . $event
+        );
+    }
+
+    /**
      * Close the socket
      *
      * @return boolean
