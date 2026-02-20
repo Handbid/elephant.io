@@ -198,10 +198,10 @@ class Client {
             $this->stdout('debug', 'Joining namespace: ' . $endpoint . ' with packet: ' . $namespacePacket);
 
             // Read namespace connection acknowledgment
-            // Always read — ensures the namespace is fully joined before
-            // emitWithAck() sends events that require the namespace.
-            $response = $this->read();
-            $this->stdout('debug', 'Namespace response: ' . $response);
+            if ($this->read) {
+                $response = $this->read();
+                $this->stdout('debug', 'Namespace response: ' . $response);
+            }
         }
         return $this;
     }
@@ -298,178 +298,11 @@ class Client {
 
         $this->write($this->encode($packet));
         $this->stdout('debug', 'Emitted: ' . $packet);
-    }
 
-    /**
-     * Emit an event and wait for server acknowledgment
-     *
-     * This provides guaranteed delivery - the method only returns successfully
-     * when the server has confirmed receipt of the event.
-     *
-     * @param string $event Event name
-     * @param array $args Event arguments
-     * @param string $endpoint Namespace (e.g., '/server')
-     * @param int $timeout Timeout in seconds to wait for ack
-     * @return bool True if acknowledged
-     * @throws \RuntimeException If ack not received within timeout
-     */
-    public function emitWithAck($event, $args, $endpoint = null, $timeout = 5) {
-        $this->of($endpoint);
-
-        // Generate unique ack ID
-        $ackId = ++$this->lastId;
-
-        // Build Socket.io 4.x event packet WITH ack ID:
-        // Format: 42/namespace,<ackId>["event",arg1,arg2,...]
-        // The ack ID comes BEFORE the JSON array
-        $eventData = array_merge([$event], (array)$args);
-        $packet = self::EIO_MESSAGE . '' . self::SIO_EVENT;
-        if ($endpoint) {
-            $packet .= $endpoint . ',';
-        }
-        $packet .= $ackId . json_encode($eventData);
-
-        $this->write($this->encode($packet));
-        $this->stdout('debug', 'Emitted with ack (id=' . $ackId . '): ' . $packet);
-
-        // Wait for ack response: 43/namespace,<ackId>[data] or 43<ackId>[data]
-        $startTime = time();
-        $attempts = 0;
-        while ((time() - $startTime) < $timeout) {
-            $attempts++;
-            $response = $this->read(1); // 1 second read timeout per attempt
-
-            if (empty($response)) {
-                // Detect dead socket early instead of spinning for full timeout
-                if ($this->fd && feof($this->fd)) {
-                    if (class_exists('\Yii', false)) {
-                        \Yii::warning("[SOCKET-DEAD] event={$event} ackId={$ackId} attempts={$attempts} - connection dead (EOF)", 'node-events');
-                    }
-                    throw new \RuntimeException(
-                        'Socket.io connection is dead (EOF) while waiting for ack on event: ' . $event
-                    );
-                }
-                usleep(50000); // 50ms sleep prevents tight spin if feof() not triggered
-                continue;
-            }
-
-            $this->stdout('debug', 'Received response: ' . $response);
-
-            // Parse ack response
-            // Format: 43/namespace,<ackId>[...] or 43<ackId>[...]
-            // Engine.IO MESSAGE (4) + Socket.IO ACK (3) = "43"
-            if (strpos($response, '43') === 0) {
-                // Extract ack ID from response
-                $ackPart = substr($response, 2); // Remove "43"
-
-                // Handle namespace prefix if present
-                if ($endpoint && strpos($ackPart, $endpoint . ',') === 0) {
-                    $ackPart = substr($ackPart, strlen($endpoint) + 1);
-                }
-
-                // Extract numeric ack ID (everything before '[')
-                $bracketPos = strpos($ackPart, '[');
-                if ($bracketPos !== false) {
-                    $responseAckId = (int)substr($ackPart, 0, $bracketPos);
-                } else {
-                    $responseAckId = (int)$ackPart;
-                }
-
-                if ($responseAckId === $ackId) {
-                    $this->stdout('debug', 'Ack received for id=' . $ackId);
-                    if (class_exists('\Yii', false)) {
-                        \Yii::info("[SOCKET-ACK-OK] event={$event} ackId={$ackId} attempts={$attempts}", 'node-events');
-                    }
-                    return true;
-                } else {
-                    $this->stdout('debug', 'Ack ID mismatch: expected=' . $ackId . ', got=' . $responseAckId);
-                    if (class_exists('\Yii', false)) {
-                        \Yii::warning("[SOCKET-ACK-MISMATCH] event={$event} expected={$ackId} got={$responseAckId}", 'node-events');
-                    }
-                }
-            }
-
-            // Handle ping during wait (keep connection alive)
-            if ($response === '2') {
-                $this->write($this->encode('3')); // Send pong
-                $this->stdout('debug', 'Responded to ping while waiting for ack');
-            }
-        }
-
-        // Log timeout
-        if (class_exists('\Yii', false)) {
-            \Yii::error("[SOCKET-ACK-TIMEOUT] event={$event} ackId={$ackId} timeout={$timeout}s attempts={$attempts}", 'node-events');
-        }
-
-        throw new \RuntimeException(
-            'Socket.io acknowledgment not received within ' . $timeout . ' seconds for event: ' . $event
-        );
-    }
-
-    /**
-     * Check if the WebSocket connection is still alive
-     *
-     * @return bool
-     */
-    public function isConnected() {
-        return $this->fd && !feof($this->fd);
-    }
-
-    /**
-     * Read any pending data from the socket and respond to Engine.IO pings.
-     * Call this between operations to keep the persistent connection alive.
-     *
-     * The Node server sends Engine.IO pings every pingInterval (default 25s).
-     * If pings go unanswered for pingTimeout (default 20s), the server closes
-     * the connection. This method drains pending pings so the connection survives
-     * idle periods between RabbitMQ messages.
-     *
-     * @return bool True if connection is still alive, false if dead
-     */
-    public function maintainConnection() {
-        if (!$this->fd || feof($this->fd)) {
-            return false;
-        }
-
-        // Non-blocking check for pending data (0 timeout)
-        $read = [$this->fd];
-        $write = $except = null;
-        $ready = stream_select($read, $write, $except, 0);
-
-        while ($ready > 0) {
-            $response = $this->read(0);
-
-            if ($response === '') {
-                break; // No more data
-            }
-
-            // Engine.IO ping → respond with pong
-            if ($response === '2') {
-                $this->write($this->encode('3'));
-                $this->stdout('debug', 'Keepalive: responded to ping');
-            }
-
-            // Check if more data is waiting
-            $read = [$this->fd];
-            $write = $except = null;
-            $ready = stream_select($read, $write, $except, 0);
-        }
-
-        return $this->fd && !feof($this->fd);
-    }
-
-    /**
-     * Reconnect by closing the current connection and re-initializing.
-     * Resets internal state (namespace subscriptions, ack IDs, session)
-     * so the new connection starts clean.
-     */
-    public function reconnect() {
-        $this->close();
-        $this->endpoints = [];
-        $this->lastId = 0;
-        $this->session = null;
-        $this->handshake();
-        $this->connect();
+        // Small delay to ensure event is processed before connection closes
+        // Required for Socket.io 4.x WebSocket framing - without this delay,
+        // the connection may close before the server processes the event
+        usleep(50000); // 50ms
     }
 
     /**
@@ -834,13 +667,12 @@ class Client {
         $this->write($this->encode(self::EIO_PING . 'probe'), false);
 
         // 2. Wait for "3probe" (pong with probe payload)
-        // Always read — this is part of the Engine.IO upgrade handshake,
-        // not an application read. Skipping leaves frames in the buffer
-        // that interfere with emitWithAck() on fresh connections.
-        $probeResponse = $this->read();
-        $this->stdout('debug', 'Probe response: ' . $probeResponse);
-        if ($probeResponse !== '3probe') {
-            $this->stdout('error', 'Expected 3probe, got: ' . $probeResponse);
+        if ($this->read) {
+            $probeResponse = $this->read();
+            $this->stdout('debug', 'Probe response: ' . $probeResponse);
+            if ($probeResponse !== '3probe') {
+                $this->stdout('error', 'Expected 3probe, got: ' . $probeResponse);
+            }
         }
 
         // 3. Send "5" (upgrade packet)
@@ -853,15 +685,14 @@ class Client {
         $this->write($this->encode($connectPacket));
 
         // Read connection acknowledgment
-        // Always read — this is the default namespace connect ack.
-        // Skipping leaves it in the buffer where emitWithAck() has to
-        // discard it, wasting read cycles on fresh connections.
-        $response = $this->read();
-        $this->stdout('debug', 'Connect response: ' . $response);
+        if ($this->read) {
+            $response = $this->read();
+            $this->stdout('debug', 'Connect response: ' . $response);
 
-        // Expected: 40{"sid":"..."} for successful connection
-        if (strpos($response, '40') !== 0) {
-            $this->stdout('error', 'Unexpected connect response: ' . $response);
+            // Expected: 40{"sid":"..."} for successful connection
+            if (strpos($response, '40') !== 0) {
+                $this->stdout('error', 'Unexpected connect response: ' . $response);
+            }
         }
 
         $this->heartbeatStamp = time();
